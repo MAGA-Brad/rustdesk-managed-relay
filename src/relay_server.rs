@@ -85,13 +85,14 @@ pub async fn start_with_bind(
     let port: u16 = port.parse()?;
     log::info!("Listening on tcp :{}", port);
     let port2 = port + 2;
+    let ws_bind_addr = crate::common::ws_bind_address(bind_addr)?;
     log::info!("Listening on websocket :{}", port2);
     let main_task = async move {
         loop {
             log::info!("Start");
             io_loop(
                 crate::common::listen_tcp(bind_addr, port).await?,
-                crate::common::listen_tcp(bind_addr, port2).await?,
+                crate::common::listen_tcp(ws_bind_addr, port2).await?,
                 crate::common::listen_console(bind_addr, port).await?,
                 &key,
             )
@@ -450,7 +451,12 @@ async fn make_pair(
             }
             Ok(response)
         };
-        let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
+        let ws_stream = tokio_tungstenite::accept_hdr_async_with_config(
+            stream,
+            callback,
+            Some(crate::common::ws_config(WS_MAX_FRAME, WS_MAX_MESSAGE)),
+        )
+        .await?;
         make_pair_(ws_stream, addr, key, limiter).await;
     } else {
         make_pair_(FramedStream::from(stream, addr), addr, key, limiter).await;
@@ -458,8 +464,18 @@ async fn make_pair(
     Ok(())
 }
 
+// Hardening: an unpaired connection has sent nothing but its RequestRelay, which is
+// tiny, so this bounds what it can make hbbr buffer; the bound is lifted on both
+// ends once the pair is made, for the session's own traffic.
+const UNPAIRED_MAX_MESSAGE: usize = 64 * 1024;
+// WebSocket limits are fixed at accept (tokio-tungstenite 0.17 cannot change them
+// later), so they also have to fit a paired session's largest message.
+const WS_MAX_FRAME: usize = 4 << 20;
+const WS_MAX_MESSAGE: usize = 16 << 20;
+
 async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limiter: Limiter) {
     let mut stream = stream;
+    stream.set_max_packet_length(UNPAIRED_MAX_MESSAGE);
     if let Ok(Some(Ok(bytes))) = timeout(30_000, stream.recv()).await {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
             if let Some(rendezvous_message::Union::RequestRelay(rf)) = msg_in.union {
@@ -471,6 +487,8 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                     let mut peer = PEERS.lock().await.remove(&rf.uuid);
                     if let Some(peer) = peer.as_mut() {
                         log::info!("Relayrequest {} from {} got paired", rf.uuid, addr);
+                        stream.set_max_packet_length(usize::MAX);
+                        peer.set_max_packet_length(usize::MAX);
                         let id = format!("{}:{}", addr.ip(), addr.port());
                         USAGE.write().await.insert(id.clone(), Default::default());
                         if !stream.is_ws() && !peer.is_ws() {
@@ -628,6 +646,7 @@ trait StreamTrait: Send + Sync + 'static {
     async fn send_raw(&mut self, bytes: Bytes) -> ResultType<()>;
     fn is_ws(&self) -> bool;
     fn set_raw(&mut self);
+    fn set_max_packet_length(&mut self, n: usize);
 }
 
 #[async_trait]
@@ -646,6 +665,10 @@ impl StreamTrait for FramedStream {
 
     fn set_raw(&mut self) {
         self.set_raw();
+    }
+
+    fn set_max_packet_length(&mut self, n: usize) {
+        self.codec_mut().set_max_packet_length(n);
     }
 }
 
@@ -680,4 +703,7 @@ impl StreamTrait for tokio_tungstenite::WebSocketStream<TcpStream> {
     }
 
     fn set_raw(&mut self) {}
+
+    // Fixed at accept by WS_MAX_FRAME / WS_MAX_MESSAGE.
+    fn set_max_packet_length(&mut self, _n: usize) {}
 }

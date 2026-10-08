@@ -34,6 +34,24 @@ pub async fn listen_tcp(
     }
 }
 
+/// Hardening: bind address for the WebSocket listeners only. `WS_BIND` (or
+/// `--ws-bind`) narrows them, e.g. to 127.0.0.1 when only a local reverse proxy
+/// should reach them; unset keeps them on the general bind address.
+pub fn ws_bind_address(bind_addr: Option<IpAddr>) -> Result<Option<IpAddr>> {
+    Ok(parse_bind_address(&get_arg("ws-bind"))?.or(bind_addr))
+}
+
+/// Hardening: tungstenite reserves a frame's whole declared length as soon as its
+/// header passes `max_frame_size`, so these bound what a header alone can make
+/// the server allocate.
+pub fn ws_config(max_frame: usize, max_message: usize) -> tungstenite::protocol::WebSocketConfig {
+    tungstenite::protocol::WebSocketConfig {
+        max_frame_size: Some(max_frame),
+        max_message_size: Some(max_message),
+        ..Default::default()
+    }
+}
+
 pub fn console_addr(bind_addr: Option<IpAddr>, port: u16) -> Option<SocketAddr> {
     let bind_addr = bind_addr?;
     if bind_addr.is_unspecified() || bind_addr == IpAddr::V4(Ipv4Addr::LOCALHOST) {
