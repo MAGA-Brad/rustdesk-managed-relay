@@ -1,3 +1,4 @@
+use crate::relay_ticket::{Check, Ticket};
 use async_speed_limit::Limiter;
 use async_trait::async_trait;
 use hbb_common::{
@@ -26,12 +27,15 @@ use std::{
     io::Error,
     net::{IpAddr, SocketAddr},
     sync::atomic::{AtomicUsize, Ordering},
+    sync::Arc,
 };
 
 type Usage = (usize, usize, usize, usize);
+type WaitingPeer = (Arc<()>, Box<dyn StreamTrait>);
 
 lazy_static::lazy_static! {
-    static ref PEERS: Mutex<HashMap<String, Box<dyn StreamTrait>>> = Default::default();
+    // Managed hardening: with its valid relay ticket, for the pairing check.
+    static ref PEERS: Mutex<HashMap<String, (WaitingPeer, Option<Ticket>)>> = Default::default();
     static ref USAGE: RwLock<HashMap<String, Usage>> = Default::default();
     static ref BLACKLIST: RwLock<HashSet<String>> = Default::default();
     static ref BLOCKLIST: RwLock<HashSet<String>> = Default::default();
@@ -42,6 +46,8 @@ static DOWNGRADE_START_CHECK: AtomicUsize = AtomicUsize::new(1_800_000); // in m
 static LIMIT_SPEED: AtomicUsize = AtomicUsize::new(32 * 1024 * 1024); // in bit/s
 static TOTAL_BANDWIDTH: AtomicUsize = AtomicUsize::new(1024 * 1024 * 1024); // in bit/s
 static SINGLE_BANDWIDTH: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024); // in bit/s
+// Fixed at the handshake, so it is sized for the session a websocket leg carries once paired.
+const WS_BUFFER_SIZE: usize = 64 << 10;
 const BLACKLIST_FILE: &str = "blacklist.txt";
 const BLOCKLIST_FILE: &str = "blocklist.txt";
 
@@ -51,7 +57,7 @@ pub async fn start_with_bind(
     port: &str,
     key: &str,
 ) -> ResultType<()> {
-    let key = get_server_sk(key);
+    let key = get_server_sk(key)?;
     if let Ok(mut file) = std::fs::File::open(BLACKLIST_FILE) {
         let mut contents = String::new();
         if file.read_to_string(&mut contents).is_ok() {
@@ -82,16 +88,20 @@ pub async fn start_with_bind(
         BLOCKLIST_FILE,
         BLOCKLIST.read().await.len()
     );
+    if ticket_mode() != TicketMode::Off {
+        let _ = crate::relay_ticket::verifying_keys();
+    }
     let port: u16 = port.parse()?;
     log::info!("Listening on tcp :{}", port);
     let port2 = port + 2;
+    let ws_bind_addr = crate::common::ws_bind_address(bind_addr)?;
     log::info!("Listening on websocket :{}", port2);
     let main_task = async move {
         loop {
             log::info!("Start");
             io_loop(
                 crate::common::listen_tcp(bind_addr, port).await?,
-                crate::common::listen_tcp(bind_addr, port2).await?,
+                crate::common::listen_tcp(ws_bind_addr, port2).await?,
                 crate::common::listen_console(bind_addr, port).await?,
                 &key,
             )
@@ -383,6 +393,7 @@ async fn io_loop(
     }
 }
 
+/// Accepts a relay connection and routes loopback console requests separately.
 async fn handle_connection(
     stream: TcpStream,
     addr: SocketAddr,
@@ -399,7 +410,12 @@ async fn handle_connection(
             if let Ok(Ok(n)) = timeout(1000, stream.read(&mut buffer[..])).await {
                 if let Ok(data) = std::str::from_utf8(&buffer[..n]) {
                     let res = check_cmd(data, limiter).await;
-                    stream.write(res.as_bytes()).await.ok();
+                    if let Err(err) = timeout(1000, stream.write_all(res.as_bytes()))
+                        .await
+                        .unwrap_or_else(|elapsed| Err(elapsed.into()))
+                    {
+                        log::warn!("Failed to send the console reply: {err}");
+                    }
                 }
             }
         });
@@ -417,6 +433,7 @@ async fn handle_connection(
     });
 }
 
+/// Prepares a TCP or WebSocket relay stream and begins pairing.
 async fn make_pair(
     stream: TcpStream,
     mut addr: SocketAddr,
@@ -442,15 +459,21 @@ async fn make_pair(
                 .or_else(|| headers.get("X-Forwarded-For"))
                 .and_then(|header_value| header_value.to_str().ok());
             if let Some(ip) = real_ip {
-                if ip.contains('.') {
-                    addr = format!("{ip}:0").parse().unwrap_or(addr);
-                } else {
-                    addr = format!("[{ip}]:0").parse().unwrap_or(addr);
+                if let Ok(ip) = ip.parse() {
+                    addr = SocketAddr::new(ip, addr.port());
                 }
             }
             Ok(response)
         };
-        let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
+        // The message bound is set in make_pair_, once the handshake is done.
+        let ws_config = tungstenite::protocol::WebSocketConfig::default()
+            .read_buffer_size(WS_BUFFER_SIZE)
+            .write_buffer_size(WS_BUFFER_SIZE);
+        let ws_stream = timeout(
+            30_000,
+            tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(ws_config)),
+        )
+        .await??;
         make_pair_(ws_stream, addr, key, limiter).await;
     } else {
         make_pair_(FramedStream::from(stream, addr), addr, key, limiter).await;
@@ -458,8 +481,19 @@ async fn make_pair(
     Ok(())
 }
 
+// Hardening: an unpaired connection has sent nothing but its RequestRelay, which is
+// tiny, so this bounds what it can make hbbr buffer; the bound is lifted on both
+// ends once the pair is made, for the session's own traffic.
+const UNPAIRED_MAX_MESSAGE: usize = 64 * 1024;
+// What a paired WebSocket leg is lifted to (the sec3 values, below tungstenite's 64 MiB message /
+// 16 MiB frame defaults); before pairing it is held to UNPAIRED_MAX_MESSAGE like a framed leg.
+const WS_MAX_FRAME: usize = 4 << 20;
+const WS_MAX_MESSAGE: usize = 16 << 20;
+
+/// Checks a configured relay key and pairs a request with a waiting connection.
 async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limiter: Limiter) {
     let mut stream = stream;
+    stream.set_max_packet_length(UNPAIRED_MAX_MESSAGE);
     if let Ok(Some(Ok(bytes))) = timeout(30_000, stream.recv()).await {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
             if let Some(rendezvous_message::Union::RequestRelay(rf)) = msg_in.union {
@@ -468,9 +502,22 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                     return;
                 }
                 if !rf.uuid.is_empty() {
-                    let mut peer = PEERS.lock().await.remove(&rf.uuid);
-                    if let Some(peer) = peer.as_mut() {
+                    // Managed hardening: hbbs's relay ticket, each side's checked on its own, then the two
+                    // against each other.
+                    let mode = ticket_mode();
+                    let Ok(ticket) = check_ticket(mode, &rf.uuid, &rf.relay_ticket, addr) else {
+                        return;
+                    };
+                    let mut peers = PEERS.lock().await;
+                    let Ok(waiting) = take_waiting(&mut *peers, mode, &rf.uuid, ticket.as_ref(), addr)
+                    else {
+                        return;
+                    };
+                    if let Some((_, mut peer)) = waiting {
+                        drop(peers);
                         log::info!("Relayrequest {} from {} got paired", rf.uuid, addr);
+                        stream.set_max_packet_length(usize::MAX);
+                        peer.set_max_packet_length(usize::MAX);
                         let id = format!("{}:{}", addr.ip(), addr.port());
                         USAGE.write().await.insert(id.clone(), Default::default());
                         if !stream.is_ws() && !peer.is_ws() {
@@ -478,7 +525,7 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                             stream.set_raw();
                             log::info!("Both are raw");
                         }
-                        if let Err(err) = relay(addr, &mut stream, peer, limiter, id.clone()).await
+                        if let Err(err) = relay(addr, &mut stream, &mut peer, limiter, id.clone()).await
                         {
                             log::info!("Relay of {} closed: {}", addr, err);
                         } else {
@@ -487,9 +534,11 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                         USAGE.write().await.remove(&id);
                     } else {
                         log::info!("New relay request {} from {}", rf.uuid, addr);
-                        PEERS.lock().await.insert(rf.uuid.clone(), Box::new(stream));
+                        let generation = Arc::new(());
+                        peers.insert(rf.uuid.clone(), ((generation.clone(), Box::new(stream)), ticket));
+                        drop(peers);
                         sleep(30.).await;
-                        PEERS.lock().await.remove(&rf.uuid);
+                        expire_waiter(&mut *PEERS.lock().await, &rf.uuid, &generation);
                     }
                 }
             }
@@ -497,6 +546,204 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
     }
 }
 
+/// Managed hardening: what hbbr does with relay tickets: `ticket_mode` in relay_settings (else the
+/// TICKET_MODE environment variable). `off` checks nothing; `log`, the default, checks and logs
+/// every ticket and refuses nothing; `enforce` refuses a connection whose ticket is missing, bad or
+/// expired. Changes are logged; a value that names no mode means log, with a warning.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TicketMode {
+    Off,
+    Log,
+    Enforce,
+}
+
+/// The mode a ticket_mode setting names, None for a value that names none. Unset (or empty) is
+/// the default, log.
+fn parse_ticket_mode(value: Option<&str>) -> Option<TicketMode> {
+    match value {
+        None | Some("") | Some("log") => Some(TicketMode::Log),
+        Some("off") => Some(TicketMode::Off),
+        Some("enforce") => Some(TicketMode::Enforce),
+        Some(_) => None,
+    }
+}
+
+/// The ticket_mode setting last seen and the mode it meant, so each change is logged once.
+#[derive(Default)]
+struct ModeSeen(Option<(Option<String>, TicketMode)>);
+
+/// What a look at the setting found.
+#[derive(Debug, PartialEq)]
+struct ModeNews {
+    mode: TicketMode,
+    /// The mode differs from the last look's.
+    changed: bool,
+    /// The setting changed to a value that names no mode (so it means log).
+    unknown: bool,
+}
+
+impl ModeSeen {
+    fn see(&mut self, value: Option<String>) -> ModeNews {
+        if let Some((last, mode)) = &self.0 {
+            if *last == value {
+                return ModeNews { mode: *mode, changed: false, unknown: false };
+            }
+        }
+        let parsed = parse_ticket_mode(value.as_deref());
+        let mode = parsed.unwrap_or(TicketMode::Log);
+        let changed = self.0.as_ref().map_or(true, |(_, last)| *last != mode);
+        self.0 = Some((value, mode));
+        ModeNews { mode, changed, unknown: parsed.is_none() }
+    }
+}
+
+fn ticket_mode() -> TicketMode {
+    static SEEN: once_cell::sync::Lazy<std::sync::Mutex<ModeSeen>> =
+        once_cell::sync::Lazy::new(Default::default);
+    let (value, source) = crate::relay_settings::get("ticket_mode");
+    let news = SEEN.lock().unwrap().see(value.clone());
+    if news.unknown {
+        log::warn!(
+            "relay ticket mode: {:?} (from {}) is not off, log or enforce; using {:?}",
+            value.unwrap_or_default(),
+            source,
+            news.mode
+        );
+    } else if news.changed {
+        log::info!("relay ticket mode: {:?} (from {})", news.mode, source);
+    }
+    news.mode
+}
+
+/// Whether `mode` lets a connection with this ticket wait or pair.
+fn ticket_allows(mode: TicketMode, check: &Check) -> bool {
+    mode != TicketMode::Enforce || matches!(check, Check::Valid(_))
+}
+
+/// Why two valid tickets on one uuid can't be its two ends, if they can't: they must be for
+/// opposite sides of the same relay between the same two devices, so one side's ticket can't open
+/// both ends, nor tickets hbbs minted for one pair of devices the other end of another's relay.
+fn mismatch(a: &Ticket, b: &Ticket) -> Option<&'static str> {
+    if a.role == b.role {
+        Some("same side")
+    } else if a.uuid != b.uuid {
+        Some("another relay")
+    } else if a.controller_id != b.controller_id || a.controlled_id != b.controlled_id {
+        Some("other devices")
+    } else {
+        None
+    }
+}
+
+/// Whether `mode` lets two connections whose valid tickets are `a` and `b` pair. A side without
+/// one (let through in log mode) isn't compared.
+fn pair_allows(mode: TicketMode, a: Option<&Ticket>, b: Option<&Ticket>) -> bool {
+    mode != TicketMode::Enforce || a.zip(b).and_then(|(a, b)| mismatch(a, b)).is_none()
+}
+
+/// At most 64 characters of what a client sent, for the log.
+fn short(s: &str) -> &str {
+    match s.char_indices().nth(64) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
+}
+
+/// Checks the relay ticket of a RequestRelay for `uuid` from `addr` and logs the outcome. Err: the
+/// connection is refused. Ok: the ticket, when valid (None for any other outcome let through).
+fn check_ticket(
+    mode: TicketMode,
+    uuid: &str,
+    ticket: &str,
+    addr: SocketAddr,
+) -> Result<Option<Ticket>, ()> {
+    if mode == TicketMode::Off {
+        return Ok(None);
+    }
+    let now = crate::relay_ticket::now_secs();
+    let check = crate::relay_ticket::verify_any(
+        &crate::relay_ticket::verifying_keys(),
+        uuid,
+        ticket,
+        now,
+    );
+    let allowed = ticket_allows(mode, &check);
+    let detail = match &check {
+        Check::Valid(t) | Check::Expired(t) => format!(
+            " ({} side, {:?} -> {:?}, expiry {}s {})",
+            t.role.as_str(),
+            short(&t.controller_id),
+            short(&t.controlled_id),
+            t.expiry.abs_diff(now),
+            if t.expiry >= now { "ahead" } else { "ago" }
+        ),
+        Check::Bad(why) => format!(" ({})", why),
+        Check::Missing => String::new(),
+    };
+    let verdict = match (allowed, &check) {
+        (_, Check::Valid(_)) => "",
+        (true, _) => ", allowed (log mode)",
+        (false, _) => ", refused",
+    };
+    log::info!(
+        "relay ticket {}: uuid {} from {}{}{}",
+        check.outcome(),
+        short(uuid),
+        addr,
+        detail,
+        verdict
+    );
+    match check {
+        Check::Valid(t) => Ok(Some(t)),
+        _ if allowed => Ok(None),
+        _ => Err(()),
+    }
+}
+
+/// What the connection from `addr` to `uuid`, whose valid ticket is `ticket` (if any), pairs with:
+/// the side waiting there, taken out of `peers`, or None, to wait itself. Err: `mode` refuses the
+/// pair, and only this connection: the side waiting stays for its own partner. Tickets that don't
+/// match are logged.
+fn take_waiting<S>(
+    peers: &mut HashMap<String, (S, Option<Ticket>)>,
+    mode: TicketMode,
+    uuid: &str,
+    ticket: Option<&Ticket>,
+    addr: SocketAddr,
+) -> Result<Option<S>, ()> {
+    let Some((_, waiting)) = peers.get(uuid) else {
+        return Ok(None);
+    };
+    let waiting = waiting.as_ref();
+    if let Some((ours, why)) = ticket.zip(waiting).and_then(|(a, b)| Some((a, mismatch(a, b)?))) {
+        let allowed = pair_allows(mode, ticket, waiting);
+        log::warn!(
+            "relay ticket: uuid {} from {} has a {} ticket that doesn't match the side waiting ({}){}",
+            short(uuid),
+            addr,
+            ours.role.as_str(),
+            why,
+            if allowed { ", allowed (log mode)" } else { ", refused" }
+        );
+        if !allowed {
+            return Err(());
+        }
+    }
+    Ok(peers.remove(uuid).map(|(peer, _)| peer))
+}
+
+/// Removes a waiting connection only if it still owns the requested pair ID.
+fn expire_waiter(
+    peers: &mut HashMap<String, (WaitingPeer, Option<Ticket>)>,
+    id: &str,
+    generation: &Arc<()>,
+) {
+    if peers.get(id).map(|((current, _), _)| Arc::ptr_eq(current, generation)).unwrap_or(false) {
+        peers.remove(id);
+    }
+}
+
+/// Forwards traffic in both directions while enforcing relay limits and timeouts.
 async fn relay(
     addr: SocketAddr,
     stream: &mut impl StreamTrait,
@@ -534,7 +781,7 @@ async fn relay(
                     total += nb;
                     total_s += nb;
                     if !bytes.is_empty() {
-                        stream.send_raw(bytes.into()).await?;
+                        timeout(30_000, stream.send_raw(bytes.into())).await??;
                     }
                 } else {
                     break;
@@ -553,7 +800,7 @@ async fn relay(
                     total += nb;
                     total_s += nb;
                     if !bytes.is_empty() {
-                        peer.send_raw(bytes.into()).await?;
+                        timeout(30_000, peer.send_raw(bytes.into())).await??;
                     }
                 } else {
                     break;
@@ -601,7 +848,62 @@ async fn relay(
     Ok(())
 }
 
-fn get_server_sk(key: &str) -> String {
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestStream {
+        data: Option<BytesMut>,
+        blocked: bool,
+    }
+
+    #[async_trait]
+    impl StreamTrait for TestStream {
+        /// Provides the test stream receive behavior.
+        async fn recv(&mut self) -> Option<Result<BytesMut, Error>> {
+            match self.data.take() {
+                Some(data) => Some(Ok(data)),
+                None => std::future::pending().await,
+            }
+        }
+        /// Simulates a relay write for the test stream.
+        async fn send_raw(&mut self, _: Bytes) -> ResultType<()> {
+            if self.blocked { std::future::pending().await } else { Ok(()) }
+        }
+        /// Uses non-WebSocket framing for the test stream.
+        fn is_ws(&self) -> bool { false }
+        /// Leaves the test stream unchanged when raw mode is requested.
+        fn set_raw(&mut self) {}
+        fn set_max_packet_length(&mut self, _: usize) {}
+    }
+
+    /// Checks that a blocked relay write ends with a timeout in the selected direction.
+    async fn check_blocked_send(from_peer: bool) {
+        let mut stream = TestStream {
+            data: if from_peer { None } else { Some(BytesMut::from(&b"x"[..])) },
+            blocked: from_peer,
+        };
+        let mut peer: Box<dyn StreamTrait> = Box::new(TestStream {
+            data: if from_peer { Some(BytesMut::from(&b"x"[..])) } else { None },
+            blocked: !from_peer,
+        });
+        let result = timeout(35_000, relay(
+            "127.0.0.1:1".parse().unwrap(), &mut stream, &mut peer,
+            Limiter::new(1_000_000.), "blocked-send-test".to_owned(),
+        )).await.expect("a blocked relay write must finish within its deadline");
+        let error = result.expect_err("the blocked write must fail");
+        assert!(error.downcast_ref::<tokio::time::error::Elapsed>().is_some());
+    }
+
+    /// Checks that stalled writes time out in either relay direction.
+    #[tokio::test]
+    async fn blocked_writes_in_both_directions_time_out() {
+        tokio::join!(check_blocked_send(false), check_blocked_send(true));
+    }
+}
+
+/// Returns the configured relay key or resolves a signing key to its public value.
+fn get_server_sk(key: &str) -> ResultType<String> {
     let mut key = key.to_owned();
     if let Ok(sk) = base64::decode(&key) {
         if sk.len() == sign::SECRETKEYBYTES {
@@ -611,7 +913,7 @@ fn get_server_sk(key: &str) -> String {
     }
 
     if key == "-" || key == "_" {
-        let (pk, _) = crate::common::gen_sk(300);
+        let (pk, _) = crate::common::gen_sk(300)?;
         key = pk;
     }
 
@@ -619,7 +921,7 @@ fn get_server_sk(key: &str) -> String {
         log::info!("Key: {}", key);
     }
 
-    key
+    Ok(key)
 }
 
 #[async_trait]
@@ -628,6 +930,7 @@ trait StreamTrait: Send + Sync + 'static {
     async fn send_raw(&mut self, bytes: Bytes) -> ResultType<()>;
     fn is_ws(&self) -> bool;
     fn set_raw(&mut self);
+    fn set_max_packet_length(&mut self, n: usize);
 }
 
 #[async_trait]
@@ -646,6 +949,10 @@ impl StreamTrait for FramedStream {
 
     fn set_raw(&mut self) {
         self.set_raw();
+    }
+
+    fn set_max_packet_length(&mut self, n: usize) {
+        self.codec_mut().set_max_packet_length(n);
     }
 }
 
@@ -670,9 +977,7 @@ impl StreamTrait for tokio_tungstenite::WebSocketStream<TcpStream> {
     }
 
     async fn send_raw(&mut self, bytes: Bytes) -> ResultType<()> {
-        Ok(self
-            .send(tungstenite::Message::Binary(bytes.to_vec()))
-            .await?) // to-do: poor performance
+        Ok(self.send(tungstenite::Message::Binary(bytes)).await?)
     }
 
     fn is_ws(&self) -> bool {
@@ -680,4 +985,298 @@ impl StreamTrait for tokio_tungstenite::WebSocketStream<TcpStream> {
     }
 
     fn set_raw(&mut self) {}
+
+    fn set_max_packet_length(&mut self, n: usize) {
+        self.set_config(|c| {
+            c.max_message_size = Some(n.min(WS_MAX_MESSAGE));
+            c.max_frame_size = Some(n.min(WS_MAX_FRAME));
+        });
+    }
+}
+
+#[cfg(test)]
+mod ticket_tests {
+    use super::*;
+    use crate::relay_ticket::{mint, Role};
+
+    fn ticket(role: Role, uuid: &str, controller_id: &str, controlled_id: &str) -> Ticket {
+        Ticket {
+            role,
+            expiry: 0,
+            uuid: uuid.into(),
+            controller_id: controller_id.into(),
+            controlled_id: controlled_id.into(),
+        }
+    }
+
+    fn valid(role: Role) -> Check {
+        Check::Valid(ticket(role, "u", "", ""))
+    }
+
+    fn addr() -> SocketAddr {
+        "192.0.2.1:40000".parse().unwrap()
+    }
+
+    #[test]
+    fn log_mode_lets_everything_through_and_enforce_only_valid_tickets() {
+        let expired = Check::Expired(ticket(Role::Controller, "u", "", ""));
+        for check in [Check::Missing, Check::Bad("x"), expired] {
+            assert!(ticket_allows(TicketMode::Off, &check));
+            assert!(ticket_allows(TicketMode::Log, &check));
+            assert!(!ticket_allows(TicketMode::Enforce, &check));
+        }
+        for mode in [TicketMode::Off, TicketMode::Log, TicketMode::Enforce] {
+            assert!(ticket_allows(mode, &valid(Role::Controlled)));
+        }
+    }
+
+    #[test]
+    fn enforce_pairs_only_opposite_sides_of_the_same_relay() {
+        let c = ticket(Role::Controller, "u", "a", "b");
+        let t = ticket(Role::Controlled, "u", "a", "b");
+        assert!(pair_allows(TicketMode::Enforce, Some(&c), Some(&t)));
+        assert!(pair_allows(TicketMode::Enforce, Some(&t), Some(&c)));
+        assert!(!pair_allows(TicketMode::Enforce, Some(&c), Some(&c)));
+        assert!(!pair_allows(TicketMode::Enforce, Some(&t), Some(&t)));
+        assert!(pair_allows(TicketMode::Log, Some(&t), Some(&t)));
+        assert!(pair_allows(TicketMode::Log, None, Some(&t)));
+        assert!(pair_allows(TicketMode::Enforce, None, None));
+        // Opposite sides, but of another pair of devices or another relay.
+        for other in [
+            ticket(Role::Controlled, "u", "x", "b"),
+            ticket(Role::Controlled, "u", "a", "x"),
+            ticket(Role::Controlled, "v", "a", "b"),
+        ] {
+            assert!(!pair_allows(TicketMode::Enforce, Some(&c), Some(&other)), "{other:?}");
+            assert!(pair_allows(TicketMode::Log, Some(&c), Some(&other)), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn tickets_minted_for_other_devices_cant_open_the_other_end_of_a_relay() {
+        // The victim's controller waits on uuid X with its ticket; the attacker got hbbs to mint
+        // it the controlled side's ticket for X too, but naming its own two devices.
+        let key = sodiumoxide::crypto::auth::hmacsha256::Key::from_slice(&[5u8; 32]).unwrap();
+        let now = 1_800_000_000;
+        let checked = |role, controller_id, controlled_id| {
+            let minted = mint(&key, role, "X", controller_id, controlled_id, now);
+            match crate::relay_ticket::verify_any(&[key.clone()], "X", &minted, now) {
+                Check::Valid(t) => t,
+                other => panic!("{other:?}"),
+            }
+        };
+        let victim = checked(Role::Controller, "victim-c", "victim-t");
+        let attacker = checked(Role::Controlled, "attacker-1", "attacker-2");
+        let mut peers = HashMap::from([("X".to_owned(), ("victim", Some(victim)))]);
+        assert_eq!(
+            take_waiting(&mut peers, TicketMode::Enforce, "X", Some(&attacker), addr()),
+            Err(())
+        );
+        let partner = checked(Role::Controlled, "victim-c", "victim-t");
+        assert_eq!(
+            take_waiting(&mut peers, TicketMode::Enforce, "X", Some(&partner), addr()),
+            Ok(Some("victim"))
+        );
+    }
+
+    #[test]
+    fn a_refused_newcomer_leaves_the_side_waiting_in_place() {
+        let mut peers = HashMap::new();
+        peers.insert("u".to_owned(), ("legit", Some(ticket(Role::Controller, "u", "a", "b"))));
+        // A second controller-side ticket in enforce: refused, and the legitimate side waits on.
+        let dup = ticket(Role::Controller, "u", "a", "b");
+        assert_eq!(take_waiting(&mut peers, TicketMode::Enforce, "u", Some(&dup), addr()), Err(()));
+        assert!(peers.contains_key("u"));
+        // Its partner then pairs with it.
+        let partner = ticket(Role::Controlled, "u", "a", "b");
+        assert_eq!(
+            take_waiting(&mut peers, TicketMode::Enforce, "u", Some(&partner), addr()),
+            Ok(Some("legit"))
+        );
+        assert!(peers.is_empty());
+        // Nothing waiting: the newcomer waits itself.
+        assert_eq!(take_waiting(&mut peers, TicketMode::Enforce, "u", Some(&partner), addr()), Ok(None));
+        // Log mode pairs the duplicate anyway (and logs it); no ticket isn't compared.
+        peers.insert("u".to_owned(), ("legit", Some(ticket(Role::Controller, "u", "a", "b"))));
+        assert_eq!(take_waiting(&mut peers, TicketMode::Log, "u", Some(&dup), addr()), Ok(Some("legit")));
+        peers.insert("u".to_owned(), ("legit", Some(ticket(Role::Controller, "u", "a", "b"))));
+        assert_eq!(take_waiting(&mut peers, TicketMode::Enforce, "u", None, addr()), Ok(Some("legit")));
+    }
+
+    #[test]
+    fn an_unknown_ticket_mode_means_log_and_is_warned_about_once_per_change() {
+        let news = |mode, changed, unknown| ModeNews { mode, changed, unknown };
+        let mut seen = ModeSeen::default();
+        assert_eq!(seen.see(None), news(TicketMode::Log, true, false));
+        assert_eq!(seen.see(Some("enforce".into())), news(TicketMode::Enforce, true, false));
+        assert_eq!(seen.see(Some("enforce".into())), news(TicketMode::Enforce, false, false));
+        // A typo: log, warned about once while it stays.
+        assert_eq!(seen.see(Some("enforced".into())), news(TicketMode::Log, true, true));
+        assert_eq!(seen.see(Some("enforced".into())), news(TicketMode::Log, false, false));
+        // Another bad value is warned about again, though the mode stays log.
+        assert_eq!(seen.see(Some("on".into())), news(TicketMode::Log, false, true));
+        assert_eq!(seen.see(Some("log".into())), news(TicketMode::Log, false, false));
+        assert_eq!(seen.see(Some("".into())), news(TicketMode::Log, false, false));
+        assert_eq!(seen.see(Some("off".into())), news(TicketMode::Off, true, false));
+    }
+
+    #[test]
+    fn a_settings_file_that_cant_be_read_keeps_the_values_last_read() {
+        use std::io::ErrorKind;
+        let mut cache = crate::relay_settings::Cache::default();
+        cache.take_read(Ok("# no value\nTicket_Mode = Enforce\n".into()));
+        assert_eq!(cache.value("ticket_mode"), Some("enforce"));
+        cache.take_read(Err(Error::from(ErrorKind::PermissionDenied)));
+        assert_eq!(cache.value("ticket_mode"), Some("enforce"));
+        cache.take_read(Err(Error::from(ErrorKind::InvalidData)));
+        assert_eq!(cache.value("ticket_mode"), Some("enforce"));
+        // A file that's gone has no settings: the environment's apply.
+        cache.take_read(Err(Error::from(ErrorKind::NotFound)));
+        assert_eq!(cache.value("ticket_mode"), None);
+    }
+
+    #[test]
+    fn short_cuts_at_a_character() {
+        assert_eq!(short("abc"), "abc");
+        let long = "é".repeat(100);
+        assert_eq!(short(&long).chars().count(), 64);
+    }
+}
+
+#[cfg(test)]
+mod message_size_tests {
+    use super::*;
+    use hbb_common::{bytes_codec::BytesCodec, tokio_util::codec::Encoder};
+
+    async fn serve_one(ws: bool) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, addr) = listener.accept().await.unwrap();
+            allow_err!(make_pair(stream, addr, "", <Limiter>::new(f64::INFINITY), ws).await);
+        });
+        addr
+    }
+
+    fn relay_request(uuid: &str) -> Vec<u8> {
+        let mut msg = RendezvousMessage::new();
+        msg.set_request_relay(RequestRelay {
+            uuid: uuid.to_owned(),
+            ..Default::default()
+        });
+        msg.write_to_bytes().unwrap()
+    }
+
+    #[hbb_common::tokio::test]
+    async fn relay_request_over_the_bound_is_refused_on_its_header() {
+        let addr = serve_one(false).await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let payload_len = UNPAIRED_MAX_MESSAGE + 1;
+        let mut frame = BytesMut::new();
+        BytesCodec::new()
+            .encode(Bytes::from(vec![0u8; payload_len]), &mut frame)
+            .unwrap();
+        client.write_all(&frame[..frame.len() - payload_len]).await.unwrap();
+        let mut byte = [0u8; 1];
+        let read = timeout(5_000, client.read(&mut byte))
+            .await
+            .expect("hbbr waited for the payload of an oversized relay request");
+        assert_eq!(read.unwrap(), 0);
+    }
+
+    async fn ws_client(addr: SocketAddr) -> tokio_tungstenite::WebSocketStream<TcpStream> {
+        let stream = TcpStream::connect(addr).await.unwrap();
+        tokio_tungstenite::client_async(format!("ws://{addr}"), stream)
+            .await
+            .unwrap()
+            .0
+    }
+
+    #[hbb_common::tokio::test]
+    async fn ws_relay_request_over_the_bound_is_refused_on_its_header() {
+        let addr = serve_one(true).await;
+        let mut ws = ws_client(addr).await;
+        let client = ws.get_mut();
+        let mut header = vec![0x82, 0xff];
+        header.extend_from_slice(&(UNPAIRED_MAX_MESSAGE as u64 + 1).to_be_bytes());
+        header.extend_from_slice(&[1, 2, 3, 4]);
+        client.write_all(&header).await.unwrap();
+        let mut buf = [0u8; 256];
+        let closed = timeout(5_000, async {
+            while client.read(&mut buf).await.unwrap_or(0) > 0 {}
+        })
+        .await;
+        assert!(closed.is_ok(), "hbbr waited for the payload of an oversized relay request");
+    }
+
+    #[hbb_common::tokio::test]
+    async fn paired_legs_carry_frames_past_the_relay_request_bound() {
+        let uuid = "paired-legs";
+        let ws_addr = serve_one(true).await;
+        let tcp_addr = serve_one(false).await;
+        let mut ws = ws_client(ws_addr).await;
+        ws.send(tungstenite::Message::Binary(relay_request(uuid).into()))
+            .await
+            .unwrap();
+        // Park the websocket leg first, so the tcp leg is the one that pairs.
+        timeout(5_000, async {
+            while !PEERS.lock().await.contains_key(uuid) {
+                sleep(0.01).await;
+            }
+        })
+        .await
+        .expect("websocket leg never parked");
+        let mut tcp = FramedStream::from(TcpStream::connect(tcp_addr).await.unwrap(), tcp_addr);
+        tcp.send_bytes(relay_request(uuid).into()).await.unwrap();
+        let big = vec![7u8; UNPAIRED_MAX_MESSAGE * 2];
+        tcp.send_bytes(big.clone().into()).await.unwrap();
+        let got = timeout(5_000, ws.next())
+            .await
+            .expect("relay did not forward the tcp frame")
+            .expect("relay closed the websocket leg")
+            .unwrap();
+        assert_eq!(got.into_data(), big);
+        ws.send(tungstenite::Message::Binary(big.clone().into()))
+            .await
+            .unwrap();
+        let got = tcp
+            .next_timeout(5_000)
+            .await
+            .expect("relay did not forward the websocket message")
+            .unwrap();
+        assert_eq!(&got[..], &big[..]);
+    }
+}
+
+#[cfg(test)]
+mod waiter_tests {
+    use super::*;
+
+    struct TestStream;
+
+    #[async_trait]
+    impl StreamTrait for TestStream {
+        /// Provides the test stream receive behavior.
+        async fn recv(&mut self) -> Option<Result<BytesMut, Error>> { None }
+        /// Simulates a relay write for the test stream.
+        async fn send_raw(&mut self, _: Bytes) -> ResultType<()> { Ok(()) }
+        /// Uses non-WebSocket framing for the test stream.
+        fn is_ws(&self) -> bool { false }
+        /// Leaves the test stream unchanged when raw mode is requested.
+        fn set_raw(&mut self) {}
+        fn set_max_packet_length(&mut self, _: usize) {}
+    }
+
+    /// Checks that an old timeout cannot remove a replacement waiter.
+    #[test]
+    fn old_waiter_cannot_expire_a_reused_pair_id() {
+        let old = Arc::new(());
+        let current = Arc::new(());
+        let mut peers: HashMap<String, (WaitingPeer, Option<Ticket>)> = HashMap::new();
+        peers.insert("pair".to_owned(), ((current.clone(), Box::new(TestStream)), None));
+        expire_waiter(&mut peers, "pair", &old);
+        assert!(peers.contains_key("pair"));
+        expire_waiter(&mut peers, "pair", &current);
+        assert!(!peers.contains_key("pair"));
+    }
 }

@@ -48,6 +48,9 @@ in the inherited process environment.
 | `ALWAYS_USE_RELAY` 🅴 | *(none)* | `N` | `Y` forces every session through a relay (disables direct/hole‑punched connections). At runtime, send `always-use-relay Y` or `always-use-relay N` to the `hbbs` [loopback console](#runtime-console). |
 | `DB_URL` 🅴 | *(none)* | `./db_v2.sqlite3` | Path/URL of the SQLite database file. See [Database](#database). |
 | `MAX_DATABASE_CONNECTIONS` 🅴 | *(none)* | `1` | Size of the SQLite connection pool. |
+| `MAX_PUNCH_REQUESTS` 🅴 | *(none)* | `100000` | Number of punch-request records kept in memory for the `punch-requests` [console](#runtime-console) command; the oldest is dropped when full. `0` disables recording. |
+| `RELAY_TICKET_KEY_FILE` 🅴 | *(none)* | `relay_ticket.key` | Managed hardening: file holding the relay-ticket key (32 random bytes, base64). `hbbs` reads it at start-up and creates it (mode 0600, written to a temporary file and renamed into place) when missing, empty or cut short; it re-reads the file when its modification time changes (checked every 15 s); without a usable key it mints no tickets. `hbbr` must be able to read the same file. |
+| `MAX_MESSAGE_KB` 🅴 | *(none)* | `64` | Largest message, in KiB, that `hbbs` accepts on its TCP and WebSocket listeners; a connection that sends a bigger one is dropped. Capped at `65536`. The default fits an online-status query for about 5000 standard 9–10 digit IDs, fewer with long custom IDs; a client whose query is too big shows no online status. |
 
 🅴 = set through the inherited process environment.
 
@@ -63,6 +66,8 @@ in the inherited process environment.
 | `KEY` | `-k`, `--key` | *(empty)* | The empty default intentionally disables relay key validation, avoiding key-pair setup and mismatch failures. To enable relay key validation, use the same non-empty key as `hbbs`; `-` / `_` have the same behavior and load or generate a key pair. An empty key allows clients without a matching key to use the relay, so choose this tradeoff deliberately on an exposed server. |
 | `BIND` | `-b`, `--bind` | all interfaces | **Available since 1.1.17.** Local IPv4 or IPv6 address on which the relay TCP and WebSocket listeners bind. Supported by `.env` and the inherited environment; `hbbr` does not support `--config`. |
 | `PORT` | `-p`, `--port` | `21117` | Relay listening port. `hbbr` also binds `PORT+2` for WebSocket relay. **Note:** when set via the `PORT` env var (not `-p`), `hbbr` listens on `PORT + 1`, so a shared `PORT=21116` makes `hbbs`=21116 and `hbbr`=21117. |
+| `RELAY_TICKET_KEY_FILE` | *(none)* | `relay_ticket.key` | Managed hardening: the relay-ticket key file `hbbs` creates; `hbbr` only reads it. It checks the file's modification time every 15 s and reads it again when it changed (or while it has no key); for 10 minutes after the key changes it still accepts tickets under the previous key. A file that becomes unreadable or invalid keeps the key already loaded. |
+| `TICKET_MODE` | *(none)* | `log` | Managed hardening: what `hbbr` does with relay tickets: `off`, `log` (check and log, refuse nothing) or `enforce` (refuse a connection whose ticket is missing, bad or expired). `ticket_mode=` in the `relay_settings` file in the working directory takes precedence and is re-read every 15 s, without a restart; if the file can't be read, the values last read stay. Any other value means `log` and is logged as a warning (once per change). |
 
 ### Relay bandwidth / QoS
 
